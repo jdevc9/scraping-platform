@@ -32,7 +32,7 @@ Plataforma enterprise de scraping e monitoramento de preços para Shopee e JD.co
 ### Subir o projeto
 
 ```bash
-git clone https://github.com/SEU_USUARIO/scraping-platform.git
+git clone https://github.com/jdevc9/scraping-platform.git
 cd scraping-platform
 cp .env.example .env
 docker compose up -d db redis backend

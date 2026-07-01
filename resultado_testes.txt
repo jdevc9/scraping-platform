@@ -1,0 +1,4 @@
+ImportError while loading conftest '/home/kali/scraping-platform/tests/conftest.py'.
+tests/conftest.py:3: in <module>
+    import pytest_asyncio
+E   ModuleNotFoundError: No module named 'pytest_asyncio'

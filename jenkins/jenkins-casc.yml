@@ -1,0 +1,84 @@
+# Jenkins Configuration as Code
+# Automatically provisions the pipeline job on first boot.
+# Reference: https://www.jenkins.io/projects/jcasc/
+
+jenkins:
+  systemMessage: "Scraping Platform — Jenkins CI/CD"
+  numExecutors: 2
+  mode: NORMAL
+  scmCheckoutRetryCount: 2
+
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "admin"
+          password: "${JENKINS_ADMIN_PASSWORD:-admin}"
+
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: STAGING_HOST
+            value: "${STAGING_HOST:-localhost}"
+          - key: PROD_HOST
+            value: "${PROD_HOST:-localhost}"
+
+tool:
+  allure:
+    installations:
+      - name: "Allure 2.29"
+        home: ""
+        properties:
+          - installSource:
+              installers:
+                - allureCommandlineInstaller:
+                    id: "2.29.0"
+
+jobs:
+  - script: |
+      pipelineJob('scraping-platform') {
+        description('Senior Automation & Scraping Platform — main pipeline')
+        keepDependencies(false)
+
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('https://github.com/YOUR_ORG/scraping-platform.git')
+                  credentials('github-credentials')
+                }
+                branch('*/main')
+              }
+            }
+            scriptPath('jenkins/Jenkinsfile')
+          }
+        }
+
+        triggers {
+          githubPush()
+          cron('H 2 * * *')  // Nightly build at ~02:00
+        }
+
+        parameters {
+          choiceParam('DEPLOY_ENV', ['none', 'staging', 'production'], 'Target deploy environment')
+          booleanParam('SKIP_E2E', false, 'Skip E2E tests')
+        }
+      }
+
+unclassified:
+  location:
+    url: "http://localhost:8080/"
+    adminAddress: "admin@scraping-platform.local"
+
+  slackNotifier:
+    teamDomain: ""
+    tokenCredentialId: ""
+
+  allure:
+    properties:
+      - installationName: "Allure 2.29"

@@ -1,0 +1,315 @@
+pipeline {
+    agent {
+        docker {
+            image 'python:3.12-slim'
+            args  '-v /var/run/docker.sock:/var/run/docker.sock -u root'
+        }
+    }
+
+    environment {
+        REGISTRY        = 'ghcr.io'
+        IMAGE_PREFIX    = "${env.GITHUB_REPOSITORY_OWNER ?: 'org'}/scraping-platform"
+        COMPOSE_FILE    = 'docker-compose.yml'
+        PYTHON_VERSION  = '3.12'
+        NODE_VERSION    = '20'
+        ALLURE_RESULTS  = 'allure-results'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name:        'DEPLOY_ENV',
+            choices:     ['none', 'staging', 'production'],
+            description: 'Target deploy environment (none = build + test only)'
+        )
+        booleanParam(
+            name:         'SKIP_E2E',
+            defaultValue: false,
+            description:  'Skip E2E tests (faster builds for hotfixes)'
+        )
+    }
+
+    stages {
+
+        // ── Stage 1: Setup ─────────────────────────────────────────────────
+        stage('Setup') {
+            steps {
+                sh '''
+                    apt-get update -qq
+                    apt-get install -y -qq curl docker.io docker-compose-plugin git nodejs npm
+                    pip install --quiet ruff mypy
+                '''
+                script {
+                    env.GIT_SHA_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                    echo "Building SHA: ${env.GIT_SHA_SHORT}"
+                }
+            }
+        }
+
+        // ── Stage 2: Lint ──────────────────────────────────────────────────
+        stage('Lint') {
+            parallel {
+                stage('Python Lint') {
+                    steps {
+                        dir('backend') {
+                            sh 'ruff check app/'
+                            sh 'ruff format --check app/'
+                        }
+                    }
+                }
+                stage('Frontend Type Check') {
+                    steps {
+                        dir('frontend') {
+                            sh 'npm ci --silent'
+                            sh 'npm run typecheck'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Stage 3: Unit & Integration Tests ──────────────────────────────
+        stage('Tests') {
+            environment {
+                DATABASE_URL      = "postgresql+asyncpg://scraping:scraping_pass@localhost:5432/scraping_test"
+                DATABASE_URL_SYNC = "postgresql://scraping:scraping_pass@localhost:5432/scraping_test"
+                REDIS_URL         = "redis://localhost:6379/0"
+                CELERY_BROKER_URL = "redis://localhost:6379/0"
+                SECRET_KEY        = "jenkins-test-secret-not-for-prod"
+            }
+            steps {
+                sh '''
+                    # Start test services
+                    docker compose -f docker-compose.yml up -d db redis
+                    sleep 8
+
+                    # Install deps
+                    cd backend
+                    pip install --quiet -r requirements.txt aiosqlite
+
+                    # Run pytest with coverage + Allure
+                    pytest ../tests/ \
+                        -v \
+                        --cov=app \
+                        --cov-report=xml:coverage.xml \
+                        --cov-report=html:htmlcov \
+                        --cov-fail-under=80 \
+                        --alluredir=../${ALLURE_RESULTS} \
+                        --tb=short
+                '''
+            }
+            post {
+                always {
+                    // Publish JUnit-compatible results
+                    junit allowEmptyResults: true, testResults: 'backend/test-results/*.xml'
+
+                    // Publish coverage
+                    publishHTML(target: [
+                        allowMissing:          false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll:               true,
+                        reportDir:             'backend/htmlcov',
+                        reportFiles:           'index.html',
+                        reportName:            'Coverage Report',
+                    ])
+
+                    sh 'docker compose down --remove-orphans || true'
+                }
+            }
+        }
+
+        // ── Stage 4: Build Docker images ───────────────────────────────────
+        stage('Build Images') {
+            steps {
+                script {
+                    def backendTag  = "${env.REGISTRY}/${env.IMAGE_PREFIX}-backend:${env.GIT_SHA_SHORT}"
+                    def frontendTag = "${env.REGISTRY}/${env.IMAGE_PREFIX}-frontend:${env.GIT_SHA_SHORT}"
+
+                    sh "docker build -t ${backendTag}  ./backend"
+                    sh "docker build -t ${frontendTag} ./frontend"
+
+                    env.BACKEND_IMAGE  = backendTag
+                    env.FRONTEND_IMAGE = frontendTag
+                }
+            }
+        }
+
+        // ── Stage 5: E2E Tests ─────────────────────────────────────────────
+        stage('E2E Tests') {
+            when {
+                expression { params.SKIP_E2E == false }
+            }
+            steps {
+                sh '''
+                    pip install --quiet playwright pytest-playwright allure-pytest
+                    playwright install chromium --with-deps
+
+                    # Spin up full stack
+                    cp .env.example .env
+                    docker compose up -d db redis backend celery_worker
+                    sleep 20
+
+                    # Seed E2E user
+                    docker compose exec -T backend python -c "
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from app.core.database import Base
+from app.models.user import User, UserRole
+from app.core.security import hash_password
+engine = create_engine('${DATABASE_URL_SYNC:-postgresql://scraping:scraping_pass@db:5432/scraping_platform}')
+Base.metadata.create_all(engine)
+with Session(engine) as s:
+    existing = s.query(User).filter_by(email='e2e@test.com').first()
+    if not existing:
+        s.add(User(email='e2e@test.com', hashed_password=hash_password('e2etest123'), role=UserRole.admin))
+        s.commit()
+print('E2E user ready')
+"
+                    # Run E2E suite
+                    pytest tests/e2e/ \
+                        -v \
+                        --alluredir=${ALLURE_RESULTS} \
+                        --tb=short \
+                        -x
+                '''
+            }
+            post {
+                always {
+                    sh 'docker compose down -v || true'
+                }
+            }
+        }
+
+        // ── Stage 6: Load Tests ────────────────────────────────────────────
+        stage('Load Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    pip install --quiet locust
+                    cp .env.example .env
+                    docker compose up -d db redis backend
+                    sleep 15
+
+                    # Run 30s smoke load test
+                    locust \
+                        -f tests/load/locustfile.py \
+                        --headless \
+                        --users 20 \
+                        --spawn-rate 5 \
+                        --run-time 30s \
+                        --host http://localhost:8000 \
+                        --csv tests/load/results \
+                        --html tests/load/report.html \
+                        --exit-code-on-error 1
+                '''
+            }
+            post {
+                always {
+                    publishHTML(target: [
+                        allowMissing:          true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll:               true,
+                        reportDir:             'tests/load',
+                        reportFiles:           'report.html',
+                        reportName:            'Load Test Report',
+                    ])
+                    sh 'docker compose down || true'
+                }
+            }
+        }
+
+        // ── Stage 7: Push images ───────────────────────────────────────────
+        stage('Push Images') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'ghcr-credentials',
+                    usernameVariable: 'GHCR_USER',
+                    passwordVariable: 'GHCR_TOKEN',
+                )]) {
+                    sh '''
+                        echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+                        docker push ${BACKEND_IMAGE}
+                        docker push ${FRONTEND_IMAGE}
+
+                        # Also tag as latest
+                        docker tag ${BACKEND_IMAGE}  ${REGISTRY}/${IMAGE_PREFIX}-backend:latest
+                        docker tag ${FRONTEND_IMAGE} ${REGISTRY}/${IMAGE_PREFIX}-frontend:latest
+                        docker push ${REGISTRY}/${IMAGE_PREFIX}-backend:latest
+                        docker push ${REGISTRY}/${IMAGE_PREFIX}-frontend:latest
+                    '''
+                }
+            }
+        }
+
+        // ── Stage 8: Deploy ────────────────────────────────────────────────
+        stage('Deploy') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV != 'none' }
+                }
+            }
+            steps {
+                script {
+                    def targetEnv = params.DEPLOY_ENV
+                    def sshCred   = targetEnv == 'production' ? 'prod-ssh-key' : 'staging-ssh-key'
+                    def sshHost   = targetEnv == 'production'
+                        ? env.PROD_HOST
+                        : env.STAGING_HOST
+
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId:  sshCred,
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER',
+                    )]) {
+                        sh """
+                            ssh -i \$SSH_KEY -o StrictHostKeyChecking=no \$SSH_USER@${sshHost} '
+                                set -e
+                                cd /opt/scraping-platform
+                                docker compose -f docker-compose.prod.yml pull
+                                docker compose -f docker-compose.prod.yml up -d --no-build
+                                docker compose -f docker-compose.prod.yml exec -T backend alembic upgrade head
+                                sleep 8
+                                curl -sf http://localhost:8000/api/v1/health || exit 1
+                                echo "Deploy to ${targetEnv} succeeded — SHA ${GIT_SHA_SHORT}"
+                            '
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Generate Allure report from all collected results
+            allure([
+                includeProperties: false,
+                jdk:               '',
+                reportBuildPolicy: 'ALWAYS',
+                results:           [[path: env.ALLURE_RESULTS]],
+            ])
+        }
+        success {
+            echo "✓ Pipeline succeeded — SHA: ${env.GIT_SHA_SHORT}"
+        }
+        failure {
+            echo "✗ Pipeline failed — check Allure report and logs above"
+        }
+        cleanup {
+            sh 'docker compose down -v --remove-orphans || true'
+            cleanWs()
+        }
+    }
+}

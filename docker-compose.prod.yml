@@ -1,0 +1,147 @@
+version: "3.9"
+
+# Production compose — uses pre-built images from GHCR.
+# Override image tags via environment variables:
+#   BACKEND_IMAGE=ghcr.io/org/scraping-platform-backend:sha-abc1234
+#   FRONTEND_IMAGE=ghcr.io/org/scraping-platform-frontend:sha-abc1234
+
+x-backend-common: &backend-common
+  image: ${BACKEND_IMAGE:-ghcr.io/org/scraping-platform-backend:latest}
+  restart: always
+  env_file: .env.production
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: scraping_db_prod
+    restart: always
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: scraping_redis_prod
+    restart: always
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    <<: *backend-common
+    container_name: scraping_backend_prod
+    ports:
+      - "8000:8000"
+    command: >
+      gunicorn app.main:app
+      -k uvicorn.workers.UvicornWorker
+      --workers 4
+      --bind 0.0.0.0:8000
+      --timeout 60
+      --access-logfile -
+      --error-logfile -
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  celery_worker:
+    <<: *backend-common
+    container_name: scraping_worker_prod
+    command: >
+      celery -A app.tasks.celery_app worker
+      --loglevel=info
+      --concurrency=8
+      --queues=scraping,alerts,default
+      --max-tasks-per-child=200
+
+  celery_beat:
+    <<: *backend-common
+    container_name: scraping_beat_prod
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+
+  flower:
+    <<: *backend-common
+    container_name: scraping_flower_prod
+    ports:
+      - "5555:5555"
+    command: celery -A app.tasks.celery_app flower --port=5555 --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASS:-flowerpass}
+    depends_on:
+      - redis
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-ghcr.io/org/scraping-platform-frontend:latest}
+    container_name: scraping_frontend_prod
+    restart: always
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: scraping_prometheus_prod
+    restart: always
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: scraping_grafana_prod
+    restart: always
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD:  ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP:      "false"
+      GF_AUTH_ANONYMOUS_ENABLED:   "false"
+      GF_SERVER_ROOT_URL:          "%(protocol)s://%(domain)s:%(http_port)s/grafana/"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:

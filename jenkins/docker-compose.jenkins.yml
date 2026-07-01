@@ -1,0 +1,33 @@
+version: "3.9"
+
+# Spin up a local Jenkins instance with Docker access.
+# Usage: docker compose -f jenkins/docker-compose.jenkins.yml up -d
+# Then open http://localhost:8080 and install suggested plugins + Allure plugin.
+
+services:
+  jenkins:
+    image: jenkins/jenkins:lts-jdk21
+    container_name: scraping_jenkins
+    restart: unless-stopped
+    privileged: true
+    user: root
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./jenkins-casc.yml:/var/jenkins_home/casc_configs/jenkins.yml
+    environment:
+      CASC_JENKINS_CONFIG: /var/jenkins_home/casc_configs/jenkins.yml
+      JAVA_OPTS: >-
+        -Djenkins.install.runSetupWizard=false
+        -Dhudson.plugins.git.GitSCM.ALLOW_LOCAL_CHECKOUT=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  jenkins_home:

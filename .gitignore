@@ -1,0 +1,15 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+htmlcov/
+.coverage
+*.egg-info/
+dist/
+build/
+node_modules/
+.DS_Store
+*.log
+/backend/alembic/versions/*.py
+!/backend/alembic/versions/.gitkeep
+prometheus_multiproc/

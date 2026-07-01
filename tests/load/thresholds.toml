@@ -1,0 +1,28 @@
+# Load Test Thresholds — defines SLOs for CI gate
+#
+# The Jenkins/GH Actions pipeline will fail if these are exceeded.
+# Measured over a 60-second run with 100 concurrent users.
+
+[thresholds]
+# Maximum acceptable failure rate (%)
+max_failure_rate_pct = 1.0
+
+# Maximum acceptable p95 response time (ms)
+max_p95_response_ms = 800
+
+# Maximum acceptable average response time (ms)
+max_avg_response_ms = 300
+
+# Minimum acceptable requests per second
+min_rps = 50
+
+[endpoints]
+# Per-endpoint SLOs (overrides global)
+[endpoints."/health"]
+max_p95_response_ms = 100
+
+[endpoints."/products"]
+max_p95_response_ms = 500
+
+[endpoints."/analytics/prices"]
+max_p95_response_ms = 1000  # analytics queries can be heavier

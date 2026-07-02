@@ -1,5 +1,8 @@
 # Senior Automation & Scraping Platform
 
+<img width="2752" height="1536" alt="Shopee_Scraper_PostgreSQL_API_Da…_202607011945" src="https://github.com/user-attachments/assets/d5ee72c7-3080-4b45-a1fd-6504d68cbb11" />
+
+
 Plataforma enterprise de scraping e monitoramento de preços para Shopee e JD.com.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
